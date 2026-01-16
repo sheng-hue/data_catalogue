@@ -426,7 +426,7 @@ def call_cortex_llm(conn: snowflake.connector.SnowflakeConnection,
     """
     # Use parameterized query to avoid SQL injection and escaping issues
     query = """
-    SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?) AS response
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s) AS response
     """
 
     cursor = conn.cursor()
