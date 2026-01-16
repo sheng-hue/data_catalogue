@@ -266,49 +266,72 @@ def format_sample_value(value: Any, data_type: str, max_length: int = 120) -> st
         return f"<error: {str(e)[:50]}>"
 
 @st.cache_data(ttl=600)
-def sample_rows_onepass(_conn: snowflake.connector.SnowflakeConnection,
-                        database: str, schema: str, view: str,
-                        n_rows: int = 2000) -> pd.DataFrame:
+def sample_rows_onepass_adaptive(_conn: snowflake.connector.SnowflakeConnection,
+                                 database: str, schema: str, view: str,
+                                 columns_meta: pd.DataFrame,
+                                 target_samples_per_column: int = 15) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     """
-    Perform one-pass sampling of the view.
-    This is much more efficient than per-column sampling for wide tables.
+    Perform adaptive one-pass sampling to achieve target samples per column.
+    Automatically increases row sample size until most columns reach target.
 
     Args:
         _conn: Snowflake connection
         database, schema, view: View identifier
-        n_rows: Number of rows to sample
+        columns_meta: DataFrame with column metadata for type information
+        target_samples_per_column: Target distinct samples per column (default 15)
 
     Returns:
-        DataFrame with sampled rows
+        Tuple of (sampled_dataframe, samples_map)
     """
-    query = f"""
-    SELECT * FROM {database}.{schema}.{view}
-    SAMPLE ({n_rows} ROWS)
-    LIMIT {n_rows}
-    """
+    # Adaptive sampling: start small, increase until we get enough samples
+    sample_sizes = [2000, 5000, 10000, 20000]
+    best_samples_map = {}
+    best_df = None
 
-    cursor = _conn.cursor()
-    try:
-        cursor.execute(query)
-        # Fetch all rows
-        rows = cursor.fetchall()
-        column_names = [desc[0] for desc in cursor.description]
+    for sample_rows in sample_sizes:
+        query = f"""
+        SELECT * FROM {database}.{schema}.{view}
+        SAMPLE ({sample_rows} ROWS)
+        LIMIT {sample_rows}
+        """
 
-        # Create DataFrame
-        df = pd.DataFrame(rows, columns=column_names)
-        return df
-    finally:
-        cursor.close()
+        cursor = _conn.cursor()
+        try:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            column_names = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(rows, columns=column_names)
+
+            # Collect samples from this DataFrame
+            samples_map = collect_samples_from_df(df, columns_meta, max_values=target_samples_per_column)
+
+            # Count how many columns achieved target
+            columns_with_target = sum(1 for samples in samples_map.values() if len(samples) >= target_samples_per_column)
+            total_columns = len(samples_map)
+            coverage = columns_with_target / total_columns if total_columns > 0 else 0
+
+            best_df = df
+            best_samples_map = samples_map
+
+            # Stop early if >90% of columns reached target
+            if coverage >= 0.9:
+                break
+
+        finally:
+            cursor.close()
+
+    return best_df, best_samples_map
 
 def collect_samples_from_df(df: pd.DataFrame, columns_meta: pd.DataFrame,
                             max_values: int = 15) -> Dict[str, List[str]]:
     """
-    Collect up to max_values distinct non-null samples for each column from the DataFrame.
+    Collect up to max_values samples for each column from the DataFrame.
+    Prefers distinct values but allows near-duplicates to reach target.
 
     Args:
         df: Sampled data DataFrame
         columns_meta: DataFrame with column metadata (column_name, data_type)
-        max_values: Maximum number of sample values to collect per column
+        max_values: Target number of sample values to collect per column
 
     Returns:
         Dictionary mapping column_name to list of formatted sample strings
@@ -328,17 +351,30 @@ def collect_samples_from_df(df: pd.DataFrame, columns_meta: pd.DataFrame,
             samples_map[col] = []
             continue
 
-        # Try to get distinct values (but don't fail if unhashable)
+        # Strategy: prefer distinct, but fill to target even with duplicates
         try:
+            # Try to get unique values first
             unique_values = non_null_values.unique()
-        except TypeError:
-            # If values are unhashable, just take first N
-            unique_values = non_null_values.values
 
-        # Take up to max_values
-        sample_values = unique_values[:max_values]
+            if len(unique_values) >= max_values:
+                # We have enough unique values
+                sample_values = unique_values[:max_values]
+            else:
+                # Not enough unique values, take all unique + some non-unique to reach target
+                sample_values = list(unique_values)
 
-        # Format each value
+                # Add more values from the series to reach target
+                remaining_needed = max_values - len(sample_values)
+                if remaining_needed > 0:
+                    # Take additional values from the original series
+                    additional_values = non_null_values.values[len(unique_values):len(unique_values) + remaining_needed]
+                    sample_values.extend(additional_values)
+
+        except (TypeError, AttributeError):
+            # If values are unhashable (can't get unique), just take first N
+            sample_values = non_null_values.values[:max_values]
+
+        # Format each value AFTER selection (to preserve distinctness before formatting)
         formatted_samples = [
             format_sample_value(val, data_type)
             for val in sample_values
@@ -347,6 +383,7 @@ def collect_samples_from_df(df: pd.DataFrame, columns_meta: pd.DataFrame,
         # Remove empty strings
         formatted_samples = [s for s in formatted_samples if s]
 
+        # Ensure we still have up to max_values after formatting
         samples_map[col] = formatted_samples[:max_values]
 
     return samples_map
@@ -477,7 +514,12 @@ def build_llm_prompt(columns_batch: pd.DataFrame,
         "You are a data documentation expert. Generate concise, accurate descriptions for the following database columns.",
         f"\n{style_inst}",
         f"\nEach description must be maximum {max_length} characters.",
-        "\nReturn ONLY valid JSON array with this exact format:",
+        "\n\nIMPORTANT INSTRUCTIONS:",
+        "\n- Infer meaning primarily from the sample values provided",
+        "\n- Use data type and column name as supporting context",
+        "\n- If uncertain about meaning, prefix with 'Likely' or 'Possibly'",
+        "\n- Confidence: 5=certain from samples, 4=high confidence, 3=medium, 2=low, 1=guess from name only",
+        "\n\nReturn ONLY valid JSON array with this exact format:",
         '[{"column_name":"COL1", "description":"...", "confidence":1-5}, ...]',
         "\nDo not include any text before or after the JSON array.\n"
     ]
@@ -501,8 +543,9 @@ def build_llm_prompt(columns_batch: pd.DataFrame,
         if include_samples and col_name in samples_map:
             samples = samples_map[col_name]
             if samples:
-                samples_str = ", ".join(str(s) for s in samples[:5])  # Limit samples in prompt
-                col_info += f"\n  Sample values: {samples_str}"
+                # Show all 15 samples (all available)
+                samples_str = ", ".join(str(s) for s in samples[:15])
+                col_info += f"\n  Sample values ({len(samples)}): {samples_str}"
 
         prompt_parts.append(col_info)
 
@@ -571,6 +614,10 @@ def generate_descriptions_batch(columns_batch: pd.DataFrame,
         Tuple of (results_list, error_message)
     """
     model = settings.get('model', 'mixtral-8x7b')
+
+    # Ensure include_samples is always True
+    settings = settings.copy()
+    settings['include_samples'] = True
 
     # Build prompt
     prompt = build_llm_prompt(columns_batch, view_description, samples_map, settings)
@@ -678,9 +725,9 @@ def generate_all_descriptions(columns_df: pd.DataFrame,
         how='left'
     )
 
-    # Add sample values as formatted strings
+    # Add sample values as formatted strings (all 15 samples)
     results_df['sample_values'] = results_df['column_name'].apply(
-        lambda col: "; ".join(samples_map.get(col, [])[:5]) if samples_map.get(col) else ""
+        lambda col: "; ".join(samples_map.get(col, [])[:15]) if samples_map.get(col) else ""
     )
 
     # Reorder columns
@@ -954,7 +1001,7 @@ def render_view_selection():
                 st.code(traceback.format_exc())
 
 def render_sampling_section():
-    """Render sampling configuration"""
+    """Render sampling configuration - fixed 15 samples per column with adaptive sampling"""
     if st.session_state.columns_data is None:
         return
 
@@ -967,48 +1014,41 @@ def render_sampling_section():
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        skip_sampling = st.checkbox(
-            "Skip sampling (faster LLM-only generation)",
-            value=False,
-            help="Skip sampling for faster processing. LLM will generate descriptions based only on column names and types."
-        )
+        st.markdown("**Samples per column:** 15 (fixed)")
+        st.caption("Adaptive sampling will automatically collect up to 15 sample values per column")
 
-        if not skip_sampling:
-            sample_size = st.slider(
-                "Sample size (rows)",
-                min_value=500,
-                max_value=5000,
-                value=2000,
-                step=500,
-                help="Number of rows to sample for collecting example values"
-            )
+        skip_sampling = st.checkbox(
+            "Skip sampling (not recommended)",
+            value=False,
+            help="Skip sampling for faster processing. LLM will generate descriptions based only on column names and types. Quality will be significantly lower."
+        )
 
     with col2:
         if st.button("🎲 Sample Data", type="primary", disabled=skip_sampling):
             try:
-                with st.spinner("Sampling data... This may take a moment for wide tables."):
-                    # Try one-pass sampling first
+                with st.spinner("Sampling data adaptively... This may take a moment for wide tables."):
+                    # Try adaptive one-pass sampling first
                     try:
-                        sample_df = sample_rows_onepass(
+                        sample_df, samples_map = sample_rows_onepass_adaptive(
                             st.session_state.connection,
                             st.session_state.selected_db,
                             st.session_state.selected_schema,
                             st.session_state.selected_view,
-                            n_rows=sample_size
-                        )
-
-                        # Collect samples from DataFrame
-                        samples_map = collect_samples_from_df(
-                            sample_df,
                             st.session_state.columns_data,
-                            max_values=15
+                            target_samples_per_column=15
                         )
 
                         st.session_state.sample_data = samples_map
-                        st.success(f"✅ Sampled {len(sample_df)} rows, collected samples for {len(samples_map)} columns")
+
+                        # Count columns that reached target
+                        columns_with_15 = sum(1 for v in samples_map.values() if len(v) >= 15)
+                        avg_samples = sum(len(v) for v in samples_map.values()) / len(samples_map) if samples_map else 0
+
+                        st.success(f"✅ Sampled {len(sample_df)} rows")
+                        st.info(f"📊 {columns_with_15}/{num_columns} columns have 15 samples (avg: {avg_samples:.1f})")
 
                     except Exception as e:
-                        st.warning(f"One-pass sampling failed: {str(e)}")
+                        st.warning(f"Adaptive sampling failed: {str(e)}")
                         st.info("Falling back to per-column sampling (this will be slower)...")
 
                         # Fallback to chunked sampling
@@ -1039,7 +1079,7 @@ def render_sampling_section():
     # Show sampling status
     if skip_sampling:
         st.session_state.sample_data = {}
-        st.info("ℹ️ Sampling skipped - LLM will generate descriptions without sample values")
+        st.warning("⚠️ Sampling skipped - LLM descriptions will be lower quality without sample values")
     elif st.session_state.sample_data is not None:
         num_sampled = sum(1 for v in st.session_state.sample_data.values() if v)
         st.success(f"✅ Samples collected for {num_sampled}/{num_columns} columns")
@@ -1132,18 +1172,16 @@ def render_llm_settings():
         # Content toggles
         st.markdown("### Include in Prompt")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
 
         with col1:
             include_types = st.checkbox("Data types", value=True)
         with col2:
-            include_samples = st.checkbox(
-                "Sample values",
-                value=True,
-                help="⚠️ May increase cost and expose data to LLM"
-            )
-        with col3:
             include_view_desc = st.checkbox("View description", value=True)
+
+        # Sample values are ALWAYS included (no toggle)
+        include_samples = True
+        st.caption("ℹ️ Sample values (15 per column) are always included for better accuracy")
 
         # Cost controls
         st.markdown("### Cost Controls")
@@ -1206,7 +1244,7 @@ def render_llm_settings():
             'batch_size': batch_size,
             'max_columns': max_columns,
             'include_types': include_types,
-            'include_samples': include_samples,
+            'include_samples': True,  # Always True - samples always included for better accuracy
             'include_view_desc': include_view_desc,
             'columns_to_generate': columns_to_generate
         }
