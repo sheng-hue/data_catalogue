@@ -413,29 +413,27 @@ def sample_rows_chunked(_conn: snowflake.connector.SnowflakeConnection,
 def call_cortex_llm(conn: snowflake.connector.SnowflakeConnection,
                    model: str, prompt: str, max_retries: int = 2) -> str:
     """
-    Call Snowflake Cortex LLM function.
+    Call Snowflake Cortex LLM function using parameterized query.
 
     Args:
         conn: Snowflake connection
-        model: Model name (e.g., 'mistral-large', 'llama2-70b-chat')
+        model: Model name (e.g., 'mistral-large', 'mixtral-8x7b', 'llama2-70b-chat')
         prompt: Prompt text
         max_retries: Number of retries on failure
 
     Returns:
         LLM response text
     """
-    query = f"""
-    SELECT SNOWFLAKE.CORTEX.COMPLETE(
-        '{model}',
-        {prompt!r}
-    ) AS response
+    # Use parameterized query to avoid SQL injection and escaping issues
+    query = """
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?) AS response
     """
 
     cursor = conn.cursor()
     try:
         for attempt in range(max_retries + 1):
             try:
-                cursor.execute(query)
+                cursor.execute(query, (model, prompt))
                 result = cursor.fetchone()
                 return result[0] if result else ""
             except Exception as e:
@@ -444,66 +442,6 @@ def call_cortex_llm(conn: snowflake.connector.SnowflakeConnection,
                 time.sleep(2 ** attempt)  # Exponential backoff
     finally:
         cursor.close()
-
-def call_external_llm(model: str, prompt: str, api_key: str,
-                     provider: str = 'openai', max_retries: int = 2) -> str:
-    """
-    Call external LLM API (OpenAI, Anthropic, etc.)
-
-    Args:
-        model: Model name
-        prompt: Prompt text
-        api_key: API key
-        provider: Provider name ('openai', 'anthropic')
-        max_retries: Number of retries
-
-    Returns:
-        LLM response text
-    """
-    if provider == 'openai':
-        try:
-            import openai
-            client = openai.OpenAI(api_key=api_key)
-
-            for attempt in range(max_retries + 1):
-                try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3,
-                        max_tokens=4000
-                    )
-                    return response.choices[0].message.content
-                except Exception as e:
-                    if attempt == max_retries:
-                        raise
-                    time.sleep(2 ** attempt)
-        except ImportError:
-            raise ImportError("openai package not installed. Run: pip install openai")
-
-    elif provider == 'anthropic':
-        try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-
-            for attempt in range(max_retries + 1):
-                try:
-                    message = client.messages.create(
-                        model=model,
-                        max_tokens=4000,
-                        temperature=0.3,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                    return message.content[0].text
-                except Exception as e:
-                    if attempt == max_retries:
-                        raise
-                    time.sleep(2 ** attempt)
-        except ImportError:
-            raise ImportError("anthropic package not installed. Run: pip install anthropic")
-
-    else:
-        raise ValueError(f"Unsupported provider: {provider}")
 
 def build_llm_prompt(columns_batch: pd.DataFrame,
                     view_description: str,
@@ -618,40 +556,37 @@ def generate_descriptions_batch(columns_batch: pd.DataFrame,
                                 view_description: str,
                                 samples_map: Dict[str, List[str]],
                                 settings: Dict[str, Any],
-                                conn: Optional[snowflake.connector.SnowflakeConnection] = None,
-                                api_key: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
+                                conn: snowflake.connector.SnowflakeConnection) -> Tuple[List[Dict], Optional[str]]:
     """
-    Generate descriptions for a batch of columns using LLM.
+    Generate descriptions for a batch of columns using Snowflake Cortex.
 
     Args:
         columns_batch: DataFrame with columns to document
         view_description: View description
         samples_map: Sample values map
         settings: Generation settings
-        conn: Snowflake connection (for Cortex)
-        api_key: External API key
+        conn: Snowflake connection (required for Cortex)
 
     Returns:
         Tuple of (results_list, error_message)
     """
-    use_cortex = settings.get('use_cortex', False)
-    model = settings.get('model', 'gpt-3.5-turbo')
-    provider = settings.get('provider', 'openai')
+    model = settings.get('model', 'mixtral-8x7b')
 
     # Build prompt
     prompt = build_llm_prompt(columns_batch, view_description, samples_map, settings)
 
-    # Call LLM
+    # Call Snowflake Cortex LLM
     try:
-        if use_cortex and conn:
-            response = call_cortex_llm(conn, model, prompt, max_retries=2)
-        elif api_key:
-            response = call_external_llm(model, prompt, api_key, provider, max_retries=2)
-        else:
-            return [], "No LLM provider configured"
+        response = call_cortex_llm(conn, model, prompt, max_retries=2)
 
         # Parse response
-        results = parse_llm_response(response)
+        try:
+            results = parse_llm_response(response)
+        except ValueError as parse_error:
+            # Retry once with stricter prompt
+            strict_prompt = prompt + "\n\nIMPORTANT: Return ONLY the JSON array. No explanations, no markdown, no code blocks. Just the JSON array starting with [ and ending with ]."
+            response = call_cortex_llm(conn, model, strict_prompt, max_retries=1)
+            results = parse_llm_response(response)
 
         # Ensure all columns are covered
         result_cols = {r['column_name'] for r in results}
@@ -670,7 +605,7 @@ def generate_descriptions_batch(columns_batch: pd.DataFrame,
         return results, None
 
     except Exception as e:
-        error_msg = f"LLM error: {str(e)}"
+        error_msg = f"Cortex LLM error: {str(e)}"
         # Return partial results with error markers
         results = []
         for _, row in columns_batch.iterrows():
@@ -685,8 +620,7 @@ def generate_all_descriptions(columns_df: pd.DataFrame,
                              view_description: str,
                              samples_map: Dict[str, List[str]],
                              settings: Dict[str, Any],
-                             conn: Optional[snowflake.connector.SnowflakeConnection] = None,
-                             api_key: Optional[str] = None,
+                             conn: snowflake.connector.SnowflakeConnection,
                              progress_callback=None) -> Tuple[pd.DataFrame, List[int]]:
     """
     Generate descriptions for all columns with batching and progress tracking.
@@ -696,8 +630,7 @@ def generate_all_descriptions(columns_df: pd.DataFrame,
         view_description: View description
         samples_map: Sample values map
         settings: Generation settings
-        conn: Snowflake connection
-        api_key: External API key
+        conn: Snowflake connection (required for Cortex)
         progress_callback: Function to call with progress updates
 
     Returns:
@@ -726,7 +659,7 @@ def generate_all_descriptions(columns_df: pd.DataFrame,
             progress_callback(batch_idx, num_batches, start_time)
 
         results, error = generate_descriptions_batch(
-            batch, view_description, samples_map, settings, conn, api_key
+            batch, view_description, samples_map, settings, conn
         )
 
         if error:
@@ -1112,46 +1045,31 @@ def render_sampling_section():
         st.success(f"✅ Samples collected for {num_sampled}/{num_columns} columns")
 
 def render_llm_settings():
-    """Render LLM settings panel"""
+    """Render LLM settings panel - Cortex only"""
     if st.session_state.columns_data is None:
         return
 
     st.markdown("---")
     st.header("🤖 LLM Settings")
 
+    st.info("ℹ️ **LLM executed inside Snowflake (Cortex)** - No external API keys required")
+
     with st.expander("⚙️ Configure LLM Generation", expanded=True):
-        # Provider selection
+        # Cortex model selection (only)
         col1, col2 = st.columns(2)
 
         with col1:
-            use_cortex = st.checkbox(
-                "Use Snowflake Cortex",
-                value=False,
-                help="Use Snowflake's built-in Cortex LLM functions"
+            cortex_models = [
+                'mixtral-8x7b',
+                'mistral-large',
+                'llama2-70b-chat',
+                'mistral-7b'
+            ]
+            model = st.selectbox(
+                "Cortex Model",
+                cortex_models,
+                help="Snowflake Cortex model to use for generation"
             )
-
-            if use_cortex:
-                cortex_models = [
-                    'mistral-large',
-                    'mixtral-8x7b',
-                    'llama2-70b-chat',
-                    'mistral-7b'
-                ]
-                model = st.selectbox("Cortex Model", cortex_models)
-                provider = 'cortex'
-            else:
-                provider = st.selectbox(
-                    "External Provider",
-                    ['openai', 'anthropic'],
-                    help="Requires API key in environment variable"
-                )
-
-                if provider == 'openai':
-                    openai_models = ['gpt-4', 'gpt-4-turbo-preview', 'gpt-3.5-turbo']
-                    model = st.selectbox("OpenAI Model", openai_models, index=2)
-                else:
-                    anthropic_models = ['claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307']
-                    model = st.selectbox("Anthropic Model", anthropic_models, index=1)
 
         with col2:
             output_style = st.radio(
@@ -1282,8 +1200,6 @@ def render_llm_settings():
 
         # Store settings in session state
         st.session_state.llm_settings = {
-            'use_cortex': use_cortex,
-            'provider': provider,
             'model': model,
             'output_style': output_style,
             'max_length': max_length,
@@ -1332,22 +1248,6 @@ def render_generation():
     if generate_button or retry_button:
         settings = st.session_state.llm_settings
 
-        # Get API key if using external provider
-        api_key = None
-        if not settings['use_cortex']:
-            provider = settings['provider']
-
-            if provider == 'openai':
-                api_key = os.environ.get('OPENAI_API_KEY')
-                if not api_key:
-                    st.error("OPENAI_API_KEY not found in environment variables")
-                    return
-            elif provider == 'anthropic':
-                api_key = os.environ.get('ANTHROPIC_API_KEY')
-                if not api_key:
-                    st.error("ANTHROPIC_API_KEY not found in environment variables")
-                    return
-
         # Filter columns to generate
         columns_df = st.session_state.columns_data[
             st.session_state.columns_data['column_name'].isin(columns_to_generate)
@@ -1367,14 +1267,13 @@ def render_generation():
             time_text.text(f"Elapsed: {format_elapsed_time(elapsed)}")
 
         try:
-            # Generate descriptions
+            # Generate descriptions using Snowflake Cortex
             results_df, failed_batches = generate_all_descriptions(
                 columns_df,
                 st.session_state.get('view_description', ''),
                 st.session_state.sample_data or {},
                 settings,
                 st.session_state.connection,
-                api_key,
                 progress_callback=update_progress
             )
 
@@ -1492,7 +1391,7 @@ def main():
         - 🔐 **Secure SSO authentication** via external browser
         - 📊 **View selection** with database/schema/view hierarchy
         - 🎲 **Efficient sampling** for wide tables (200-1200 columns)
-        - 🤖 **LLM-powered descriptions** with Snowflake Cortex or external APIs
+        - 🤖 **LLM-powered descriptions** with Snowflake Cortex (executed inside Snowflake)
         - 📦 **Batch processing** with progress tracking and error recovery
         - 📥 **Export to CSV/Excel** with formatting
 
