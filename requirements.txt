@@ -1,0 +1,14 @@
+# Core dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+snowflake-connector-python>=3.3.0
+
+# Excel export
+openpyxl>=3.1.0
+
+# LLM providers (optional - install based on your needs)
+openai>=1.3.0
+anthropic>=0.7.0
+
+# Additional utilities
+python-dateutil>=2.8.0
