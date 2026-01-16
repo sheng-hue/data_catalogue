@@ -325,16 +325,16 @@ def sample_rows_onepass_adaptive(_conn: snowflake.connector.SnowflakeConnection,
 def collect_samples_from_df(df: pd.DataFrame, columns_meta: pd.DataFrame,
                             max_values: int = 15) -> Dict[str, List[str]]:
     """
-    Collect up to max_values samples for each column from the DataFrame.
-    Prefers distinct values but allows near-duplicates to reach target.
+    Collect up to max_values DISTINCT samples for each column from the DataFrame.
+    Only returns unique values - never pads with duplicates.
 
     Args:
         df: Sampled data DataFrame
         columns_meta: DataFrame with column metadata (column_name, data_type)
-        max_values: Target number of sample values to collect per column
+        max_values: Maximum number of distinct sample values per column (up to 15)
 
     Returns:
-        Dictionary mapping column_name to list of formatted sample strings
+        Dictionary mapping column_name to list of formatted sample strings (all distinct)
     """
     samples_map = {}
 
@@ -351,27 +351,16 @@ def collect_samples_from_df(df: pd.DataFrame, columns_meta: pd.DataFrame,
             samples_map[col] = []
             continue
 
-        # Strategy: prefer distinct, but fill to target even with duplicates
+        # Only collect distinct values (no duplicates)
         try:
-            # Try to get unique values first
+            # Get unique values only
             unique_values = non_null_values.unique()
-
-            if len(unique_values) >= max_values:
-                # We have enough unique values
-                sample_values = unique_values[:max_values]
-            else:
-                # Not enough unique values, take all unique + some non-unique to reach target
-                sample_values = list(unique_values)
-
-                # Add more values from the series to reach target
-                remaining_needed = max_values - len(sample_values)
-                if remaining_needed > 0:
-                    # Take additional values from the original series
-                    additional_values = non_null_values.values[len(unique_values):len(unique_values) + remaining_needed]
-                    sample_values.extend(additional_values)
+            # Take up to max_values distinct values (don't pad with duplicates)
+            sample_values = unique_values[:max_values]
 
         except (TypeError, AttributeError):
-            # If values are unhashable (can't get unique), just take first N
+            # If values are unhashable (can't get unique), take first N values
+            # This will naturally be distinct if the data has distinct values
             sample_values = non_null_values.values[:max_values]
 
         # Format each value AFTER selection (to preserve distinctness before formatting)
