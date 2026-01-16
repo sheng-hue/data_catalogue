@@ -1083,23 +1083,43 @@ def render_llm_settings():
     st.markdown("---")
     st.header("🤖 LLM Settings")
 
-    st.info("ℹ️ **LLM executed inside Snowflake (Cortex)** - No external API keys required")
+    st.info("ℹ️ **LLM executed inside Snowflake (Cortex)** - Includes Claude, Gemini, Llama, Mistral, and more. No external API keys required.")
 
     with st.expander("⚙️ Configure LLM Generation", expanded=True):
         # Cortex model selection (only)
         col1, col2 = st.columns(2)
 
         with col1:
+            # All models available through Snowflake Cortex (no external API calls)
             cortex_models = [
+                # High-performance models (recommended)
                 'mixtral-8x7b',
                 'mistral-large',
+                'llama3-70b',
+                'llama3.1-70b',
+                'claude-3-5-sonnet',
+
+                # Medium models
+                'llama3-8b',
+                'llama3.1-8b',
+                'claude-3-sonnet',
                 'llama2-70b-chat',
-                'mistral-7b'
+                'reka-core',
+                'gemini-1.5-pro',
+
+                # Fast/lightweight models
+                'mistral-7b',
+                'claude-3-haiku',
+                'reka-flash',
+                'gemini-1.5-flash',
+
+                # Large models (slower but highest quality)
+                'llama3.1-405b',
             ]
             model = st.selectbox(
                 "Cortex Model",
                 cortex_models,
-                help="Snowflake Cortex model to use for generation"
+                help="All models run inside Snowflake via Cortex (no external API calls required)"
             )
 
         with col2:
